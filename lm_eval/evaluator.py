@@ -85,12 +85,16 @@ def simple_evaluate(
     confirm_run_unsafe_code: bool = False,
     metadata: dict[str, Any] | None = None,
     verifyit_enabled: bool = False,
+    verifyit_timeout: float = 120.0,
 ) -> EvalResults | None:
     """Instantiate and evaluate a model on a list of tasks.
 
     Args:
         verifyit_enabled (bool): Use native verifyit grading and reject unmapped contracts.
             Defaults to source grading and does not require verifyit.
+        verifyit_timeout (float): Per-record/filter deadline for native short-answer
+            extraction, normalization and grading, including worker startup. Trusted
+            parent capture/serialization are accounted synchronously; late results fail.
         model (str | LM): Name of model or LM object. See
             lm_eval.models.__init__.py for available aliases.
         model_args: String or dict arguments for each model class, e.g.,
@@ -377,6 +381,7 @@ def simple_evaluate(
         verbosity=verbosity,
         confirm_run_unsafe_code=confirm_run_unsafe_code,
         verifyit_enabled=verifyit_enabled,
+        verifyit_timeout=verifyit_timeout,
     )
     if verbosity is not None:
         setup_logging(verbosity=verbosity)
@@ -446,12 +451,16 @@ def evaluate(
     verbosity: str = "INFO",
     confirm_run_unsafe_code: bool = False,
     verifyit_enabled: bool = False,
+    verifyit_timeout: float = 120.0,
 ) -> EvalResults | None:
     """Instantiate and evaluate a model on a list of tasks.
 
     Args:
         verifyit_enabled (bool): Use native verifyit grading and reject unmapped contracts.
             Defaults to source grading and does not require verifyit.
+        verifyit_timeout (float): Per-record/filter deadline for native short-answer
+            extraction, normalization and grading, including worker startup. Trusted
+            parent capture/serialization are accounted synchronously; late results fail.
         lm (LM): Language Model.
         task_dict (TaskDict): Dictionary returned by TaskManager.load() containing
             'tasks', 'groups', and 'group_map' entries.
@@ -622,7 +631,14 @@ def evaluate(
     # TODO: del model here, maybe (idea: allow user to specify device of e.g. reward model separately)
     for (task_name, acc), limit in zip(eval_results_acc.items(), limits, strict=True):
         task = acc["task"]
-        task.apply_filters()
+        short_answer = verifyit_enabled and task.config.task in {"nq_open", "triviaqa"}
+        if short_answer:
+            from lm_eval.verifyit_short_answer import short_answer_filter_keys
+
+            filter_keys = short_answer_filter_keys(task)
+        else:
+            task.apply_filters()
+            filter_keys = task.instances[0].filtered_resps
 
         ### Collect values of metrics on all datapoints ###
         # # unpack results and sort back in order and return control to Task
@@ -635,7 +651,7 @@ def evaluate(
         for instances in instances_by_doc_id.values():
             instances.sort(key=lambda x: x.idx)
         # iterate over different filters used
-        for filter_key in task.instances[0].filtered_resps:
+        for filter_key in filter_keys:
             indices = samples.get(task_name, None) if samples is not None else None
             doc_iterator = task.doc_iterator(
                 rank=RANK,
@@ -646,8 +662,15 @@ def evaluate(
             for doc_id, doc in doc_iterator:
                 doc_id_true = indices[doc_id] if indices else doc_id
                 requests = instances_by_doc_id[doc_id]
-                responses = [req.filtered_resps[filter_key] for req in requests]
-                if verifyit_enabled:
+                responses = [] if short_answer else [req.filtered_resps[filter_key] for req in requests]
+                preparation = None
+                if short_answer:
+                    from lm_eval.verifyit_short_answer import short_answer_metrics
+
+                    metrics, preparation = short_answer_metrics(
+                        task, doc, requests, filter_key, verifyit_timeout
+                    )
+                elif verifyit_enabled:
                     from verifyit.adapters.harness_native import native_task_metrics
                     from verifyit.grade import InvalidTask
 
@@ -694,6 +717,8 @@ def evaluate(
                         "prompt_hash": hash_string(requests[0].arguments[0]),
                         "target_hash": hash_string(str(target)),
                     }
+                    if preparation is not None:
+                        example["verifyit_preparation"] = preparation
                     example.update(metrics)
                     acc["logged_samples"].append(example)
                 for metric, value in metrics.items():
