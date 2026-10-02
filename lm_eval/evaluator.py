@@ -64,7 +64,7 @@ def simple_evaluate(
     cache_requests: bool = False,
     rewrite_requests_cache: bool = False,
     delete_requests_cache: bool = False,
-    limit: int | float | None = None,
+    limit: float | None = None,
     samples: dict[str, list[int]] | None = None,
     bootstrap_iters: int = 100000,
     check_integrity: bool = False,
@@ -84,10 +84,13 @@ def simple_evaluate(
     fewshot_random_seed: int = DEFAULT_OTHER_SEED,
     confirm_run_unsafe_code: bool = False,
     metadata: dict[str, Any] | None = None,
+    verifyit_enabled: bool = False,
 ) -> EvalResults | None:
     """Instantiate and evaluate a model on a list of tasks.
 
     Args:
+        verifyit_enabled (bool): Use native verifyit grading and reject unmapped contracts.
+            Defaults to source grading and does not require verifyit.
         model (str | LM): Name of model or LM object. See
             lm_eval.models.__init__.py for available aliases.
         model_args: String or dict arguments for each model class, e.g.,
@@ -158,6 +161,9 @@ def simple_evaluate(
     Returns:
         dict | None: Dictionary of results, or None if not on rank 0.
     """
+    if type(verifyit_enabled) is not bool:
+        raise ValueError("verifyit_enabled must be a boolean")
+
     if verbosity is not None:
         eval_logger.info("Setting verbosity through simple_evaluate is deprecated.")
     start_date = time.time()
@@ -370,6 +376,7 @@ def simple_evaluate(
         fewshot_as_multiturn=fewshot_as_multiturn,
         verbosity=verbosity,
         confirm_run_unsafe_code=confirm_run_unsafe_code,
+        verifyit_enabled=verifyit_enabled,
     )
     if verbosity is not None:
         setup_logging(verbosity=verbosity)
@@ -411,6 +418,8 @@ def simple_evaluate(
                 "fewshot_seed": fewshot_random_seed,
             }
         )
+        if verifyit_enabled:
+            results["config"]["verifyit_enabled"] = True
         results["git_hash"] = get_git_commit_hash()
         results["date"] = start_date
         add_env_info(results)  # additional environment info to results
@@ -436,10 +445,13 @@ def evaluate(
     fewshot_as_multiturn: bool = False,
     verbosity: str = "INFO",
     confirm_run_unsafe_code: bool = False,
+    verifyit_enabled: bool = False,
 ) -> EvalResults | None:
     """Instantiate and evaluate a model on a list of tasks.
 
     Args:
+        verifyit_enabled (bool): Use native verifyit grading and reject unmapped contracts.
+            Defaults to source grading and does not require verifyit.
         lm (LM): Language Model.
         task_dict (TaskDict): Dictionary returned by TaskManager.load() containing
             'tasks', 'groups', and 'group_map' entries.
@@ -474,6 +486,8 @@ def evaluate(
     Returns:
         dict | None: Dictionary of results, or None if not on rank 0.
     """
+    if type(verifyit_enabled) is not bool:
+        raise ValueError("verifyit_enabled must be a boolean")
 
     if limit is not None and samples is not None:
         raise ValueError(
@@ -632,9 +646,25 @@ def evaluate(
             for doc_id, doc in doc_iterator:
                 doc_id_true = indices[doc_id] if indices else doc_id
                 requests = instances_by_doc_id[doc_id]
-                metrics = task.process_results(
-                    doc, [req.filtered_resps[filter_key] for req in requests]
-                )
+                responses = [req.filtered_resps[filter_key] for req in requests]
+                if verifyit_enabled:
+                    from verifyit.adapters.harness_native import native_task_metrics
+                    from verifyit.grade import InvalidTask
+
+                    from lm_eval.verifyit_dispatch import prepare_responses
+
+                    responses, empty_output = prepare_responses(
+                        task, doc, responses, filter_key
+                    )
+                    metrics = native_task_metrics(
+                        task, doc, responses, exact_empty_output=empty_output
+                    )
+                    if metrics is None:
+                        raise InvalidTask(
+                            f"No native verifyit contract for task {task_name}"
+                        )
+                else:
+                    metrics = task.process_results(doc, responses)
                 if log_samples:
                     target = task.doc_to_target(doc)
                     example = {
@@ -705,6 +735,9 @@ def evaluate(
             if LMEVAL_HASHMM and hasattr(lm, "MULTIMODAL"):
                 samples = hash_dict_images(samples)
 
-        return res._to_eval_results(samples=samples)
+        output = res._to_eval_results(samples=samples)
+        if verifyit_enabled:
+            output["config"] = {"verifyit_enabled": True}
+        return output
     else:
         return None
