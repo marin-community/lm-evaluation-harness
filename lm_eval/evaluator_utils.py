@@ -42,15 +42,13 @@ def print_writeout(task: Task) -> None:
                 f"Task: {task}; document {inst.doc_id}; context prompt (starting on next line):\
     \n{inst.args[0]}\n(end of prompt on previous line)\ntarget string or answer choice index (starting on next line):\n{task.doc_to_target(inst.doc)}\n(end of target on previous line)"
             )
-            eval_logger.info(f"Request: {str(inst)}")
+            eval_logger.info(f"Request: {inst!s}")
             break
 
 
-def get_sample_size(task, limit: int | float | None) -> int | None:
+def get_sample_size(task, limit: float | None) -> int | None:
     if limit is not None:
-        limit = (
-            int(math.ceil(len(task.eval_docs) * limit)) if limit < 1.0 else int(limit)
-        )
+        limit = math.ceil(len(task.eval_docs) * limit) if limit < 1.0 else int(limit)
     return limit
 
 
@@ -174,6 +172,8 @@ def _compute_task_aggregations(
     task: Task,
     raw_metrics: dict[tuple[str, str], list],
     bootstrap_iters: int | None = 100000,
+    *,
+    verifyit_enabled: bool = False,
 ) -> tuple[dict[str, Any], int]:
     """
     Compute aggregated metrics from raw per-sample metrics.
@@ -199,6 +199,13 @@ def _compute_task_aggregations(
             )
             agg_fn = mean
 
+        if verifyit_enabled:
+            from verifyit.adapters.harness_rolling import rolling_task_aggregation
+
+            native = rolling_task_aggregation(task, metric)
+            if native is not None:
+                agg_fn = native
+
         metric_key = f"{metric},{filter_key}"
         agg_metrics[metric_key] = agg_fn(items)
         sample_len = len(items)  # TODO: reflects only the last metric's count
@@ -223,6 +230,8 @@ def _collect_results(
     eval_results_acc: dict[str, ResultAcc],
     groups: dict[str, Group] | None = None,
     bootstrap_iters: int | None = 100000,
+    *,
+    verifyit_enabled: bool = False,
 ) -> EvalAcc:
     """
     Collect and aggregate task results into EvalAcc container.
@@ -245,7 +254,7 @@ def _collect_results(
         # Compute aggregated metrics
         # TODO: note: currently assume all metrics are scalar-valued
         agg_metrics, sample_len = _compute_task_aggregations(
-            task, acc["raw_metrics"], bootstrap_iters
+            task, acc["raw_metrics"], bootstrap_iters, verifyit_enabled=verifyit_enabled
         )
 
         # Get task config
@@ -350,6 +359,8 @@ def _process_results(
     eval_results_acc: dict[str, ResultAcc],
     groups: dict[str, Group] | None = None,
     bootstrap_iters: int | None = 100000,
+    *,
+    verifyit_enabled: bool = False,
 ) -> EvalAcc:
     """
     Process evaluation results.
@@ -384,7 +395,12 @@ def _process_results(
         eval_results = results._to_eval_results()
     """
     # Collect task results (includes aggregation)
-    results = _collect_results(eval_results_acc, groups or {}, bootstrap_iters)
+    results = _collect_results(
+        eval_results_acc,
+        groups or {},
+        bootstrap_iters,
+        verifyit_enabled=verifyit_enabled,
+    )
 
     # Aggregate group metrics
     results = aggregate_groups(results)

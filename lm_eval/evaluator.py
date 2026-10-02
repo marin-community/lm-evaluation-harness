@@ -727,7 +727,9 @@ def evaluate(
                     )
 
     if RANK == 0:
-        res = _process_results(eval_results_acc, groups, bootstrap_iters)
+        res = _process_results(
+            eval_results_acc, groups, bootstrap_iters, verifyit_enabled=verifyit_enabled
+        )
 
         samples = None
         if log_samples:
