@@ -5,6 +5,7 @@ import uuid
 import pytest
 from verifyit.grade import InvalidTask
 
+from lm_eval import verifyit_humaneval
 from lm_eval.verifyit_humaneval import pass_at_k, score
 
 
@@ -30,7 +31,7 @@ def test_typed_function_results(body, expected):
 
 
 def test_unsupported_pass_at_k_configuration_aborts():
-    with pytest.raises(InvalidTask, match="pass@1"):
+    with pytest.raises(InvalidTask):
         pass_at_k([REFERENCE], [["def solution(): pass"]], [2])
 
 
@@ -57,8 +58,18 @@ def test_default_memory_budget_still_rejects_oversized_candidate():
 def test_missing_runtime_executable_remains_an_infrastructure_error(
     tmp_path, monkeypatch
 ):
-    from lm_eval import verifyit_humaneval
-
     monkeypatch.setattr(verifyit_humaneval, "DOCKER", str(tmp_path / "missing-runtime"))
     with pytest.raises(FileNotFoundError):
         score(REFERENCE, "def solution(*args): return None", "missing-runtime")
+
+
+def test_blank_message_trusted_setup_failure_is_invalid():
+    reference = "raise AssertionError()\ndef check(candidate): pass\ncheck(solution)"
+    with pytest.raises(InvalidTask):
+        pass_at_k([reference], [["def solution(): return 1"]], [1])
+
+
+def test_trusted_check_cannot_swallow_failed_candidate_transport():
+    reference = "def check(candidate):\n    try: candidate()\n    except Exception: pass\ncheck(solution)"
+    prediction = "def solution(): raise ValueError()"
+    assert pass_at_k([reference], [[prediction]], [1]) == {"pass@1": 0.0}

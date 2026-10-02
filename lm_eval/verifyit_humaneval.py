@@ -3,7 +3,6 @@
 import ast
 import hashlib
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -13,7 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from verifyit.grade import InvalidTask, Status, run
-from verifyit.spec import ScriptSpec, render_spec
+from verifyit.spec import PytestSpec, render_spec
 
 from lm_eval.verifyit_function_worker import MAX_BYTES, decode, encode, read, write
 
@@ -60,7 +59,12 @@ def enable(config):
 
 
 def entry_point(reference):
-    tree = ast.parse(reference)
+    if not isinstance(reference, str) or not reference.strip():
+        raise InvalidTask("HumanEval requires nonempty trusted source tests")
+    try:
+        tree = ast.parse(reference)
+    except (SyntaxError, RecursionError) as error:
+        raise InvalidTask("Malformed HumanEval trusted test source") from error
     last = tree.body[-1] if tree.body else None
     if not (
         isinstance(last, ast.Expr)
@@ -178,44 +182,72 @@ def score(
     memory_bytes=256 * 1024 * 1024,
     resource_limit_bytes=None,
 ):
-    entry = entry_point(reference)
-    calls = 0
-    try:
-        with candidate_function(
+    return (
+        _grade(
+            reference,
             prediction,
-            entry,
             name,
             image=image,
             result_observation=result_observation,
             max_bytes=max_bytes,
             memory_bytes=memory_bytes,
             resource_limit_bytes=resource_limit_bytes,
-        ) as remote:
+        ).reward
+        == 1.0
+    )
 
-            def candidate(*args, **kwargs):
-                nonlocal calls
-                calls += 1
-                return remote(*args, **kwargs)
 
-            try:
-                namespace = {entry: candidate}
-                # Benchmark-owned source assertions, never candidate code.
-                exec(reference, namespace)  # noqa: S102
-                if calls == 0:
-                    raise InvalidTask("HumanEval reference executed no candidate calls")
-                return True
-            except (AssertionError, ValueError, BrokenPipeError, EOFError):
-                return False
-            except (InvalidTask, TimeoutError):
-                raise
-            except Exception as error:
-                if calls:
-                    return False
-                raise InvalidTask(
-                    "Trusted reference failed before calling candidate"
-                ) from error
-    except (ValueError, BrokenPipeError, EOFError):
-        return False
+def _grade(reference, prediction, name, **worker_options):
+    entry = entry_point(reference)
+    if DOCKER is None:
+        raise RuntimeError("Docker executable is unavailable")
+    subprocess.run(  # noqa: S603 - fixed Docker image inspection.
+        [DOCKER, "image", "inspect", worker_options.get("image", IMAGE)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=10,
+    )
+    prediction = prediction if isinstance(prediction, str) else ""
+    with tempfile.TemporaryDirectory(prefix="verifyit-humaneval-") as directory:
+        tests = Path(directory).resolve()
+        payload = {
+            "reference": reference,
+            "prediction": prediction,
+            "entry": entry,
+            "name": name,
+            "worker_options": worker_options,
+        }
+        (tests / "input.json").write_text(json.dumps(payload))
+        (tests / "test_candidate.py").write_text(TRUSTED_TEST)
+        spec = PytestSpec(
+            paths=("test_candidate.py",),
+            must_pass=("test_candidate.py::test_candidate",),
+            python=sys.executable,
+            timeout=30,
+        )
+        config = tests / "verifier.toml"
+        config.write_text(render_spec(spec))
+        try:
+            verdict = run(config, tests)
+        finally:
+            subprocess.run(  # noqa: S603 - cleanup of the exact owned candidate container.
+                [DOCKER, "rm", "-f", name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+        metadata_path = tests / "execution.json"
+        if metadata_path.is_file():
+            metadata = json.loads(metadata_path.read_text())
+            if "invalid_reference" in metadata:
+                raise InvalidTask(metadata["invalid_reference"])
+        if verdict.status is not Status.SCORED:
+            raise RuntimeError(
+                f"HumanEval verifier failed: {verdict.status}: {verdict.detail}"
+            )
+        return verdict
 
 
 def pass_at_k(references, predictions, k=None):
@@ -226,71 +258,53 @@ def pass_at_k(references, predictions, k=None):
         or len(predictions[0]) != 1
     ):
         raise InvalidTask("HumanEval integration requires one sample and pass@1")
-    reference, prediction = references[0], predictions[0][0]
-    if not isinstance(reference, str) or not isinstance(prediction, str):
-        raise InvalidTask("HumanEval requires string reference and candidate")
-    entry_point(reference)
-    subprocess.run(  # noqa: S603 - fixed Docker inspection/cleanup command.
-        [DOCKER, "image", "inspect", IMAGE],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        timeout=10,
+    verdict = _grade(
+        references[0], predictions[0][0], "verifyit-humaneval-" + uuid.uuid4().hex
     )
-    name = "verifyit-humaneval-" + uuid.uuid4().hex
-    try:
-        with tempfile.TemporaryDirectory(prefix="verifyit-humaneval-") as directory:
-            tests = Path(directory)
-            payload = tests / "input.json"
-            payload.write_text(
-                json.dumps(
-                    {"reference": reference, "prediction": prediction, "name": name}
-                )
-            )
-            (tests / "run.sh").write_text('exec "$@"\n')
-            spec = ScriptSpec(
-                "run.sh",
-                args=(sys.executable, "-m", "lm_eval.verifyit_humaneval", str(payload)),
-                timeout=30,
-                verdict_file="result.json",
-            )
-            config = tests / "verifier.toml"
-            config.write_text(render_spec(spec))
-            verdict = run(config, tests)
-    finally:
-        subprocess.run(  # noqa: S603 - fixed Docker inspection/cleanup command.
-            [DOCKER, "rm", "-f", name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-            check=False,
-        )
-    if verdict.status != Status.SCORED:
-        raise RuntimeError(
-            f"HumanEval verifier failed: {verdict.status}: {verdict.detail}"
-        )
     return {"pass@1": verdict.reward}
 
 
-def main():
-    payload = json.loads(Path(sys.argv[1]).read_text())
+TRUSTED_TEST = r"""
+import ast
+import json
+from pathlib import Path
+from lm_eval.verifyit_humaneval import candidate_function
+
+
+def test_candidate():
+    payload = json.loads(Path("input.json").read_text())
+    metadata = {}
+    calls = 0
     try:
-        passed = score(payload["reference"], payload["prediction"], payload["name"])
-        verdict = {
-            "status": "scored",
-            "reward": float(passed),
-            "detail": {"image": IMAGE},
-        }
-    except InvalidTask as error:
-        verdict = {
-            "status": "invalid_task",
-            "reward": 0,
-            "detail": {"error": str(error)},
-        }
-    (Path(os.environ["VERIFYIT_LOGS_DIR"]) / "result.json").write_text(
-        json.dumps(verdict)
-    )
-
-
-if __name__ == "__main__":
-    main()
+        tree = ast.parse(payload["reference"])
+        namespace = {}
+        try:
+            exec(compile(ast.Module(body=tree.body[:-1], type_ignores=[]), "reference.py", "exec"), namespace)
+        except Exception as error:
+            metadata["invalid_reference"] = str(error)
+            raise
+        check_name = tree.body[-1].value.func.id
+        if not callable(namespace.get(check_name)):
+            metadata["invalid_reference"] = "Trusted reference check is not callable"
+            raise ValueError(metadata["invalid_reference"])
+        with candidate_function(payload["prediction"], payload["entry"], payload["name"], **payload["worker_options"]) as remote:
+            def candidate(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                try:
+                    return remote(*args, **kwargs)
+                except Exception:
+                    metadata["transport_failed"] = True
+                    raise
+            namespace[payload["entry"]] = candidate
+            try:
+                exec(compile(ast.Module(body=[tree.body[-1]], type_ignores=[]), "reference.py", "exec"), namespace)
+            finally:
+                if calls == 0:
+                    metadata["invalid_reference"] = "Trusted reference executed no candidate calls"
+                if metadata.get("transport_failed"):
+                    raise ValueError("Candidate transport failed during trusted checks")
+    finally:
+        metadata["candidate_calls"] = calls
+        Path("execution.json").write_text(json.dumps(metadata))
+"""

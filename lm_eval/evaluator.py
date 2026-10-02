@@ -651,14 +651,19 @@ def evaluate(
                     from verifyit.adapters.harness_native import native_task_metrics
                     from verifyit.grade import InvalidTask
 
-                    from lm_eval.verifyit_dispatch import prepare_responses
+                    from lm_eval.verifyit_dispatch import (
+                        execution_metrics,
+                        prepare_responses,
+                    )
 
                     responses, empty_output = prepare_responses(
                         task, doc, responses, filter_key
                     )
-                    metrics = native_task_metrics(
-                        task, doc, responses, exact_empty_output=empty_output
-                    )
+                    metrics = execution_metrics(task, doc, responses, filter_key)
+                    if metrics is None:
+                        metrics = native_task_metrics(
+                            task, doc, responses, exact_empty_output=empty_output
+                        )
                     if metrics is None:
                         raise InvalidTask(
                             f"No native verifyit contract for task {task_name}"
