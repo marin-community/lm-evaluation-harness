@@ -50,6 +50,7 @@ Homepage = "https://github.com/EleutherAI/lm-evaluation-harness"
 Repository = "https://github.com/EleutherAI/lm-evaluation-harness"
 
 [project.optional-dependencies]
+verifyit = ["verifyit @ git+https://github.com/marin-community/verifyit@b08a5ee8d94fcb4a2134562aee94ff9715dadd14", "harbor-config @ git+https://github.com/marin-community/harbor@6b2e76e1dae5c084eed05edefefffcec8c0c1ad9#subdirectory=packages/harbor-config", "pytest", "pytest-json-report"]
 # Model backend dependencies
 api = ["requests", "aiohttp", "tenacity", "tqdm", "tiktoken"]
 archiver = ["jsonlines", "zstandard"]
