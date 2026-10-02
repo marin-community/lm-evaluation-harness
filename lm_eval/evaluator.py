@@ -666,7 +666,11 @@ def evaluate(
             for doc_id, doc in doc_iterator:
                 doc_id_true = indices[doc_id] if indices else doc_id
                 requests = instances_by_doc_id[doc_id]
-                responses = [] if short_answer else [req.filtered_resps[filter_key] for req in requests]
+                responses = (
+                    []
+                    if short_answer
+                    else [req.filtered_resps[filter_key] for req in requests]
+                )
                 preparation = None
                 if short_answer:
                     from lm_eval.verifyit_short_answer import short_answer_metrics
