@@ -7,11 +7,22 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from contextlib import contextmanager
+from dataclasses import asdict, replace
+from datetime import datetime
 from pathlib import Path
 
-from verifyit.grade import InvalidTask, Status, run
+from harbor_config.errors import ErrorCategory
+from verifyit.file_ops.read import read_regular_bytes
+from verifyit.grade import InvalidTask, Status, finalize_preparation_failure, run
+from verifyit.json_objects import unique_object
+from verifyit.preparation.errors import (
+    InvalidPreparation,
+    PreparationError,
+    PreparationFailure,
+)
 from verifyit.spec import PytestSpec, render_spec
 
 from lm_eval.verifyit_function_worker import MAX_BYTES, decode, encode, read, write
@@ -79,6 +90,48 @@ def entry_point(reference):
     return last.value.args[0].id
 
 
+def infrastructure_failure(error, stage):
+    failure = PreparationFailure(
+        Status.INFRA_ERROR,
+        ErrorCategory.UNKNOWN,
+        type(error).__name__,
+        str(error),
+        stage,
+    )
+    return PreparationError(failure, finalize_preparation_failure(**asdict(failure)))
+
+
+def remove_container(name):
+    """Remove the owned container, accepting only verified absence on failure."""
+    try:
+        removal = subprocess.run(  # noqa: S603 - Fixed Docker command uses the trusted owned name.
+            [DOCKER, "rm", "-f", name],
+            check=False,
+            capture_output=True,
+            timeout=10,
+        )
+        if removal.returncode:
+            remaining = subprocess.run(  # noqa: S603 - Fixed Docker query uses the trusted owned name.
+                [
+                    DOCKER,
+                    "container",
+                    "ls",
+                    "--all",
+                    "--filter",
+                    f"name=^{name}$",
+                    "--format",
+                    "{{.Names}}",
+                ],
+                check=True,
+                capture_output=True,
+                timeout=10,
+            )
+            if remaining.stdout.strip():
+                removal.check_returncode()
+    except (OSError, subprocess.SubprocessError) as error:
+        raise infrastructure_failure(error, "candidate_cleanup") from error
+
+
 @contextmanager
 def candidate_function(
     prediction,
@@ -92,7 +145,9 @@ def candidate_function(
     resource_limit_bytes=None,
 ):
     if DOCKER is None:
-        raise RuntimeError("Docker executable is unavailable")
+        raise infrastructure_failure(
+            FileNotFoundError("Docker executable is unavailable"), "candidate_launch"
+        )
     if memory_bytes is not None and (
         type(memory_bytes) is not int or memory_bytes <= 0
     ):
@@ -102,58 +157,98 @@ def candidate_function(
     ):
         raise InvalidTask("Candidate resource limit must be a positive byte count")
     worker = Path(__file__).with_name("verifyit_function_worker.py").resolve()
-    process = subprocess.Popen(  # noqa: S603 - fixed worker command; candidate source travels over stdin.
-        [
-            DOCKER,
-            "run",
-            "--rm",
-            "-i",
-            "--name",
-            name,
-            "--network",
-            "none",
-            "--read-only",
-            "--pids-limit",
-            "64",
-            *(["--memory", str(memory_bytes)] if memory_bytes is not None else []),
-            "--cpus",
-            "1",
-            "--cap-drop",
-            "ALL",
-            "--security-opt",
-            "no-new-privileges",
-            "--user",
-            "65534:65534",
-            "--tmpfs",
-            "/tmp:rw,noexec,nosuid,size=16m",  # noqa: S108 - private container tmpfs.
-            "--mount",
-            f"type=bind,source={worker},target=/worker.py,readonly",
-            image,
-            "python",
-            "-I",
-            "/worker.py",
-        ],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
     try:
-        write(
-            process.stdin,
-            {
-                "code": prediction,
-                "entry_point": entry,
-                "result_observation": result_observation,
-                "max_bytes": max_bytes,
-                **(
-                    {"resource_limit_bytes": resource_limit_bytes}
-                    if resource_limit_bytes is not None
-                    else {}
-                ),
-            },
+        process = subprocess.Popen(  # noqa: S603 - fixed worker command; candidate source travels over stdin.
+            [
+                DOCKER,
+                "run",
+                "-i",
+                "--name",
+                name,
+                "--network",
+                "none",
+                "--read-only",
+                "--pids-limit",
+                "64",
+                *(["--memory", str(memory_bytes)] if memory_bytes is not None else []),
+                "--cpus",
+                "1",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges",
+                "--user",
+                "65534:65534",
+                "--tmpfs",
+                "/tmp:rw,noexec,nosuid,size=16m",  # noqa: S108 - private container tmpfs.
+                "--mount",
+                f"type=bind,source={worker},target=/worker.py,readonly",
+                image,
+                "python",
+                "-I",
+                "/worker.py",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
         )
-        if read(process.stdout) != {"ready": True}:
-            raise ValueError("Candidate worker failed to initialize")
+    except OSError as error:
+        raise infrastructure_failure(error, "candidate_launch") from error
+
+    try:
+        try:
+            write(
+                process.stdin,
+                {
+                    "code": prediction,
+                    "entry_point": entry,
+                    "result_observation": result_observation,
+                    "max_bytes": max_bytes,
+                    **(
+                        {"resource_limit_bytes": resource_limit_bytes}
+                        if resource_limit_bytes is not None
+                        else {}
+                    ),
+                },
+            )
+            if read(process.stdout) != {"ready": True}:
+                raise ValueError("Candidate worker failed to initialize")
+        except (OSError, ValueError) as error:
+            # A retained container's daemon-owned state distinguishes a worker
+            # that executed candidate code from failure to start the runtime.
+            try:
+                inspected = subprocess.run(  # noqa: S603 - Fixed Docker inspection uses the trusted owned name.
+                    [
+                        DOCKER,
+                        "container",
+                        "inspect",
+                        "--format",
+                        "{{json .State}}",
+                        name,
+                    ],
+                    check=True,
+                    capture_output=True,
+                    timeout=10,
+                )
+                state = json.loads(inspected.stdout)
+                started = state["StartedAt"]
+                if (
+                    not isinstance(started, str)
+                    or datetime.fromisoformat(started).year == 1
+                ):
+                    raise RuntimeError("Candidate container did not start")
+            except (
+                OSError,
+                subprocess.SubprocessError,
+                ValueError,
+                KeyError,
+                TypeError,
+                RuntimeError,
+            ) as launch_error:
+                raise infrastructure_failure(
+                    launch_error, "candidate_launch"
+                ) from error
+            raise
 
         def candidate(*args, **kwargs):
             write(process.stdin, encode((args, kwargs)), max_bytes)
@@ -161,14 +256,22 @@ def candidate_function(
 
         yield candidate
     finally:
-        subprocess.run(  # noqa: S603 - fixed Docker inspection/cleanup command.
-            [DOCKER, "rm", "-f", name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-            check=False,
-        )
-        process.wait(timeout=10)
+        try:
+            remove_container(name)
+        finally:
+            # Reap the owned CLI even when Docker cannot remove the container.
+            try:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=10)
+            except (OSError, subprocess.SubprocessError) as error:
+                raise infrastructure_failure(error, "candidate_cleanup") from error
+            finally:
+                try:
+                    process.stdin.close()
+                    process.stdout.close()
+                except OSError as error:
+                    raise infrastructure_failure(error, "candidate_cleanup") from error
 
 
 def score(
@@ -183,7 +286,7 @@ def score(
     resource_limit_bytes=None,
 ):
     return (
-        _grade(
+        grade_function(
             reference,
             prediction,
             name,
@@ -197,17 +300,27 @@ def score(
     )
 
 
-def _grade(reference, prediction, name, **worker_options):
+def grade_function(
+    reference, prediction, name, *, timeout=30, preparation=None, **worker_options
+):
+    """Grade isolated candidate calls against protected trusted pytest checks."""
+    deadline = time.monotonic() + timeout
     entry = entry_point(reference)
     if DOCKER is None:
-        raise RuntimeError("Docker executable is unavailable")
-    subprocess.run(  # noqa: S603 - fixed Docker image inspection.
-        [DOCKER, "image", "inspect", worker_options.get("image", IMAGE)],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        timeout=10,
-    )
+        raise infrastructure_failure(
+            FileNotFoundError("Docker executable is unavailable"), "candidate_launch"
+        )
+    try:
+        subprocess.run(  # noqa: S603 - fixed Docker image inspection.
+            [DOCKER, "image", "inspect", worker_options.get("image", IMAGE)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=max(0.0, min(10, deadline - time.monotonic())),
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise infrastructure_failure(error, "candidate_image") from error
+
     prediction = prediction if isinstance(prediction, str) else ""
     with tempfile.TemporaryDirectory(prefix="verifyit-humaneval-") as directory:
         tests = Path(directory).resolve()
@@ -217,37 +330,85 @@ def _grade(reference, prediction, name, **worker_options):
             "entry": entry,
             "name": name,
             "worker_options": worker_options,
+            "preparation": preparation,
         }
         (tests / "input.json").write_text(json.dumps(payload))
         (tests / "test_candidate.py").write_text(TRUSTED_TEST)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise infrastructure_failure(
+                TimeoutError("Candidate preparation exceeded its deadline"),
+                "candidate_prepare",
+            )
         spec = PytestSpec(
             paths=("test_candidate.py",),
             must_pass=("test_candidate.py::test_candidate",),
             python=sys.executable,
-            timeout=30,
+            timeout=remaining,
         )
         config = tests / "verifier.toml"
         config.write_text(render_spec(spec))
         try:
             verdict = run(config, tests)
         finally:
-            subprocess.run(  # noqa: S603 - cleanup of the exact owned candidate container.
-                [DOCKER, "rm", "-f", name],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=10,
-                check=False,
-            )
+            remove_container(name)
+
         metadata_path = tests / "execution.json"
         if metadata_path.is_file():
-            metadata = json.loads(metadata_path.read_text())
+            try:
+                metadata = json.loads(
+                    read_regular_bytes(metadata_path), object_pairs_hook=unique_object
+                )
+                if not isinstance(metadata, dict):
+                    raise ValueError("Invalid protected execution metadata")  # noqa: TRY004 - Preserve malformed-artifact ValueError classification.
+                failure = None
+                if "preparation_failure" in metadata:
+                    values = metadata["preparation_failure"]
+                    if set(values) != {
+                        "status",
+                        "category",
+                        "error_type",
+                        "message",
+                        "stage",
+                    } or any(not isinstance(value, str) for value in values.values()):
+                        raise ValueError("Invalid protected preparation failure")
+                    failure = PreparationFailure(
+                        Status(values["status"]),
+                        ErrorCategory(values["category"]),
+                        values["error_type"],
+                        values["message"],
+                        values["stage"],
+                    )
+            except (ValueError, KeyError, TypeError, OSError) as error:
+                failure = PreparationFailure(
+                    Status.INFRA_ERROR,
+                    ErrorCategory.UNKNOWN,
+                    type(error).__name__,
+                    str(error),
+                    "protected_metadata",
+                )
+            if failure is not None:
+                verdict = finalize_preparation_failure(**asdict(failure))
+                if verdict.status is not Status.SCORED:
+                    error_class = (
+                        InvalidPreparation
+                        if verdict.status is Status.INVALID_TASK
+                        else PreparationError
+                    )
+                    raise error_class(failure, verdict)
             if "invalid_reference" in metadata:
                 raise InvalidTask(metadata["invalid_reference"])
+        if verdict.status is Status.INVALID_TASK:
+            raise InvalidTask(str(verdict.detail))
         if verdict.status is not Status.SCORED:
             raise RuntimeError(
                 f"HumanEval verifier failed: {verdict.status}: {verdict.detail}"
             )
-        return verdict
+        return (
+            replace(verdict, detail={**verdict.detail, "preparation": preparation})
+            if preparation
+            else verdict
+        )
 
 
 def pass_at_k(references, predictions, k=None):
@@ -258,7 +419,7 @@ def pass_at_k(references, predictions, k=None):
         or len(predictions[0]) != 1
     ):
         raise InvalidTask("HumanEval integration requires one sample and pass@1")
-    verdict = _grade(
+    verdict = grade_function(
         references[0], predictions[0][0], "verifyit-humaneval-" + uuid.uuid4().hex
     )
     return {"pass@1": verdict.reward}
@@ -269,6 +430,8 @@ import ast
 import json
 from pathlib import Path
 from lm_eval.verifyit_humaneval import candidate_function
+from verifyit.preparation.errors import PreparationError
+from dataclasses import asdict
 
 
 def test_candidate():
@@ -299,11 +462,17 @@ def test_candidate():
             namespace[payload["entry"]] = candidate
             try:
                 exec(compile(ast.Module(body=[tree.body[-1]], type_ignores=[]), "reference.py", "exec"), namespace)
+            except PreparationError as error:
+                metadata["preparation_failure"] = asdict(error.failure)
+                raise
             finally:
                 if calls == 0:
                     metadata["invalid_reference"] = "Trusted reference executed no candidate calls"
-                if metadata.get("transport_failed"):
+                if metadata.get("transport_failed") and "preparation_failure" not in metadata:
                     raise ValueError("Candidate transport failed during trusted checks")
+    except PreparationError as error:
+        metadata["preparation_failure"] = asdict(error.failure)
+        raise
     finally:
         metadata["candidate_calls"] = calls
         Path("execution.json").write_text(json.dumps(metadata))
